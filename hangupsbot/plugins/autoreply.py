@@ -1,31 +1,81 @@
-import asyncio, re, logging
+import asyncio, re, logging, json, random
 
-from hangups.ui.utils import get_conv_name
+import plugins
 
-""" Cache to keep track of what keywords are being watched. Listed by user_id """
-keywords = {}
 
-def _initialise(command):
-    command.register_handler(_handle_autoreply)
-    return []
+def _initialise(bot):
+    plugins.register_handler(_handle_autoreply, type="message")
+    plugins.register_admin_command(["autoreply"])
 
-@asyncio.coroutine
+
 def _handle_autoreply(bot, event, command):
+    autoreplies_enabled = bot.get_config_suboption(event.conv.id_, 'autoreplies_enabled')
+    if not autoreplies_enabled:
+        return
+
     """Handle autoreplies to keywords in messages"""
+
+    logging.info("autoreply: {}".format(event.conv.id_))
 
     autoreplies_list = bot.get_config_suboption(event.conv_id, 'autoreplies')
     if autoreplies_list:
-        for kwds, sentence in autoreplies_list:
+        for kwds, sentences in autoreplies_list:
             for kw in kwds:
-                if words_in_text(kw, event.text) or kw == "*":
-                    bot.send_message(event.conv, sentence)
+                if _words_in_text(kw, event.text) or kw == "*":
+                    if isinstance(sentences, list):
+                        message = random.choice(sentences)
+                    else:
+                        message = sentences
+                    bot.send_message_parsed(event.conv, message)
                     break
 
-def words_in_text(word, text):
+
+def _words_in_text(word, text):
     """Return True if word is in text"""
 
-    #TODO: This is identical to regex in line 33 of subscribe.py!
+    if word.startswith("regex:"):
+        word = word[6:]
+    else:
+        word = re.escape(word)
 
-    regexword = "\\b" + word + "\\b"
+    regexword = "(?<!\w)" + word + "(?!\w)"
 
     return True if re.search(regexword, text, re.IGNORECASE) else False
+
+
+def autoreply(bot, event, cmd=None, *args):
+    """adds or removes an autoreply.
+    Format:
+    /bot autoreply add [["question1","question2"],"answer"] // add an autoreply
+    /bot autoreply remove [["question"],"answer"] // remove an autoreply
+    /bot autoreply // view all autoreplies
+    """
+
+    path = ["autoreplies"]
+    argument = " ".join(args)
+    html = ""
+    value = bot.config.get_by_path(path)
+
+    if cmd == 'add':
+        if isinstance(value, list):
+            value.append(json.loads(argument))
+            bot.config.set_by_path(path, value)
+            bot.config.save()
+        else:
+            html = "Append failed on non-list"
+    elif cmd == 'remove':
+        if isinstance(value, list):
+            value.remove(json.loads(argument))
+            bot.config.set_by_path(path, value)
+            bot.config.save()
+        else:
+            html = "Remove failed on non-list"
+
+    # Reload the config
+    bot.config.load()
+
+    if html == "":
+        value = bot.config.get_by_path(path)
+        html = "<b>Autoreply config:</b> <br /> {}".format(value)
+
+    bot.send_html_to_conversation(event.conv_id, html)

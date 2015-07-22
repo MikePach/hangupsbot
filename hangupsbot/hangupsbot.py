@@ -4,11 +4,19 @@ import os, sys, argparse, logging, shutil, asyncio, time, signal
 import gettext
 gettext.install('hangupsbot', localedir=os.path.join(os.path.dirname(__file__), 'locale'))
 
+"""set environment variable to determine localisation:
+    export HANGOUTSBOT_LOCALE=<supported language>
+"""
+HANGOUTSBOT_LOCALE = os.environ.get("HANGOUTSBOT_LOCALE")
+if HANGOUTSBOT_LOCALE:
+    locale = gettext.translation('hangupsbot', localedir=os.path.join(os.path.dirname(__file__), 'locale'), languages=[HANGOUTSBOT_LOCALE])
+    locale.install()
+
 import appdirs
 import hangups
 
-from utils import simple_parse_to_segments, class_from_name
-from hangups.ui.utils import get_conv_name
+from utils import simple_parse_to_segments, class_from_name, conversation_memory
+
 try:
     from hangups.schemas import OffTheRecordStatus
 except ImportError:
@@ -51,20 +59,55 @@ class FakeConversation(object):
 
     @asyncio.coroutine
     def send_message(self, segments, image_id=None, otr_status=None):
-        if segments:
-            serialised_segments = [seg.serialize() for seg in segments]
-        else:
-            serialised_segments = None
+        with (yield from asyncio.Lock()):
+            if segments:
+                serialised_segments = [seg.serialize() for seg in segments]
+            else:
+                serialised_segments = None
 
-        try:
-            yield from self._client.sendchatmessage(self.id_, serialised_segments, image_id=image_id, otr_status=otr_status)
-        except (TypeError, AttributeError):
-            # in the event the hangups library doesn't support image sending
-            try:
-                yield from self._client.sendchatmessage(self.id_, serialised_segments, otr_status=otr_status)
-            except (TypeError, AttributeError):
-                # in the event the hangups library doesn't support otr_status (note that image support assumes otr_status support)
-                yield from self._client.sendchatmessage(self.id_, serialised_segments)
+            yield from self._client.sendchatmessage(
+                self.id_, serialised_segments,
+                image_id=image_id, otr_status=otr_status
+            )
+
+
+class StatusEvent:
+    """base class for all non-ConversationEvent
+        TypingEvent
+        WatermarkEvent
+    """
+    def __init__(self, bot, state_update_event):
+        self.conv_event = state_update_event
+        self.conv_id = state_update_event.conversation_id.id_
+        self.conv = None
+        self.event_id = None
+        self.user_id = None
+        self.user = None
+        self.timestamp = None
+        self.text = ''
+        self.from_bot = False
+
+
+class TypingEvent(StatusEvent):
+    def __init__(self, bot, state_update_event):
+        super().__init__(bot, state_update_event)
+        self.user_id = state_update_event.user_id
+        self.timestamp = state_update_event.timestamp
+        self.user = bot.get_hangups_user(state_update_event.user_id)
+        if self.user.is_self:
+            self.from_bot = True
+        self.text = "typing"
+
+
+class WatermarkEvent(StatusEvent):
+    def __init__(self, bot, state_update_event):
+        super().__init__(bot, state_update_event)
+        self.user_id = state_update_event.participant_id
+        self.timestamp = state_update_event.latest_read_timestamp
+        self.user = bot.get_hangups_user(state_update_event.participant_id)
+        if self.user.is_self:
+            self.from_bot = True
+        self.text = "watermark"
 
 
 class ConversationEvent(object):
@@ -79,16 +122,20 @@ class ConversationEvent(object):
         self.timestamp = conv_event.timestamp
         self.text = conv_event.text.strip() if isinstance(conv_event, hangups.ChatMessageEvent) else ''
 
-    def print_debug(self):
+    def print_debug(self, bot=None):
         """Print informations about conversation event"""
-        print(_('eid/dtime: {}/{}').format(self.event_id, self.timestamp.astimezone(tz=None).strftime('%Y-%m-%d %H:%M:%S')))
-        print(_('cid/cname: {}/{}').format(self.conv_id, get_conv_name(self.conv, truncate=True)))
-        if(self.user_id.chat_id == self.user_id.gaia_id):
-            print(_('uid/uname: {}/{}').format(self.user_id.chat_id, self.user.full_name))
+        print('eid/dtime: {}/{}'.format(self.event_id, self.timestamp.astimezone(tz=None).strftime('%Y-%m-%d %H:%M:%S')))
+        if not bot:
+            # don't crash on old usage, instruct dev to supply bot
+            print('cid/cname: {}/undetermined, supply parameter: bot'.format(self.conv_id))
         else:
-            print(_('uid/uname: {}!{}/{}').format(self.user_id.chat_id, self.user_id.gaia_id, self.user.full_name))
-        print(_('txtlen/tx: {}/{}').format(len(self.text), self.text))
-        print(_('eventdump: completed --8<--'))
+            print('cid/cname: {}/{}'.format(self.conv_id, bot.conversations.get_name(self.conv)))
+        if self.user_id.chat_id == self.user_id.gaia_id:
+            print('uid/uname: {}/{}'.format(self.user_id.chat_id, self.user.full_name))
+        else:
+            print('uid/uname: {}!{}/{}'.format(self.user_id.chat_id, self.user_id.gaia_id, self.user.full_name))
+        print('txtlen/tx: {}/{}'.format(len(self.text), self.text))
+        print('eventdump: completed --8<--')
 
 
 class HangupsBot(object):
@@ -116,7 +163,7 @@ class HangupsBot(object):
         self.memory = None
         if memory_file:
             print(_("HangupsBot: memory file will be used: {}").format(memory_file))
-            self.memory = config.Config(memory_file)
+            self.memory = config.Config(memory_file, failsafe_backups=3)
             if not os.path.isfile(memory_file):
                 try:
                     print(_("creating memory file: {}").format(memory_file))
@@ -172,7 +219,7 @@ class HangupsBot(object):
 
             # initialise pluggable framework
             hooks.load(self)
-            sinks.start(self, loop)
+            sinks.start(self)
 
             # Connect to Hangouts
             # If we are forcefully disconnected, try connecting again
@@ -186,7 +233,7 @@ class HangupsBot(object):
                     loop.run_until_complete(self._client.connect())
                     sys.exit(0)
                 except Exception as e:
-                    logging.exception(_("unrecoverable low-level error"))
+                    logging.exception("CLIENT: unrecoverable low-level error")
                     print(_('Client unexpectedly disconnected:\n{}').format(e))
                     print(_('Waiting {} seconds...').format(5 + retry * 5))
                     time.sleep(5 + retry * 5)
@@ -213,39 +260,37 @@ class HangupsBot(object):
 
     def send_message_segments(self, conversation, segments, context=None, image_id=None):
         """Send chat message segments"""
-        otr_status = None
 
         # Ignore if the user hasn't typed a message.
         if type(segments) is list and len(segments) == 0:
             return
 
-
         # add default context if none exists
         if not context:
             context = {}
-        context["base"] = self._messagecontext_legacy()
+        if "base" not in context:
+            context["base"] = self._messagecontext_legacy()
 
-        # reduce conversation to the only things we need: the id and history
+        # reduce conversation to the only things we need: conversation_id
         if isinstance(conversation, (FakeConversation, hangups.conversation.Conversation)):
             conversation_id = conversation.id_
-            # Turn history off if it's off in the conversation
-            try:
-                otr_status = (OffTheRecordStatus.OFF_THE_RECORD
-                    if conversation.is_off_the_record
-                    else OffTheRecordStatus.ON_THE_RECORD)
-            except (KeyError, AttributeError):
-                pass
         elif isinstance(conversation, str):
             conversation_id = conversation
-            # Turn history off if it's off in the conversation
-            try:
-                otr_status = (OffTheRecordStatus.OFF_THE_RECORD
-                    if self._conv_list.get(conversation).is_off_the_record
-                    else OffTheRecordStatus.ON_THE_RECORD)
-            except (KeyError, AttributeError):
-                pass
         else:
             raise ValueError(_('could not identify conversation id'))
+
+        # determine OTR status based on conversation memory
+        otr_status = OffTheRecordStatus.ON_THE_RECORD
+        try:
+            if self.conversations.catalog[conversation_id]["history"]:
+                otr_status = OffTheRecordStatus.ON_THE_RECORD
+            else:
+                otr_status = OffTheRecordStatus.OFF_THE_RECORD
+        except KeyError:
+            # rare scenario where a conversation was not refreshed
+            # once the initial message goes through, convmem will be updated
+            logging.warning("SEND_MESSAGE_SEGMENTS(): could not determine otr for {}".format(
+                conversation_id))
 
         # by default, a response always goes into a single conversation only
         broadcast_list = [(conversation_id, segments)]
@@ -284,26 +329,73 @@ class HangupsBot(object):
         try:
             _all_conversations = self._conv_list.get_all()
             convs = _all_conversations
-            logging.info(_("list_conversations() returned {} conversation(s)").format(len(convs)))
+            logging.info("list_conversations(): {} returned".format(len(convs)))
         except Exception as e:
-            logging.exception(_("list_conversations()"))
+            logging.exception("LIST_CONVERSATIONS(): failed")
             raise
 
         return convs
 
+    def get_hangups_user(self, user_id):
+        hangups_user = False
+
+        if isinstance(user_id, str):
+            chat_id = user_id
+            gaia_id = user_id
+        else:
+            chat_id = user_id.chat_id
+            gaia_id = user_id.gaia_id
+
+        UserID = hangups.user.UserID(chat_id=chat_id, gaia_id=gaia_id)
+
+        """from hangups, if it exists"""
+        if not hangups_user:
+            try:
+                hangups_user = self._user_list._user_dict[UserID]
+            except KeyError as e:
+                pass
+
+        """from permanent conversation user/memory"""
+        if not hangups_user:
+            if self.memory.exists(["user_data", chat_id, "_hangups"]):
+                _cached = self.memory.get_by_path(["user_data", chat_id, "_hangups"])
+
+                hangups_user = hangups.user.User(
+                    UserID, 
+                    _cached["full_name"],
+                    _cached["first_name"],
+                    _cached["photo_url"],
+                    _cached["emails"],
+                    _cached["is_self"] )
+
+        """if all else fails, create an "unknown" user"""
+        if not hangups_user:
+            hangups_user = hangups.user.User(
+                UserID,
+                "unknown user",
+                None,
+                None,
+                [],
+                False )
+
+        return hangups_user
+
+
     def get_users_in_conversation(self, conv_ids):
-        """list all users in supplied conv_id(s).
-        supply many conv_id as a list.
-        """
+        """list all unique users in supplied conv_id or list of conv_ids"""
+
         if isinstance(conv_ids, str):
             conv_ids = [conv_ids]
-        all_users = []
         conv_ids = list(set(conv_ids))
-        for conversation in self.list_conversations():
-            for room_id in conv_ids:
-                if room_id in conversation.id_:
-                    all_users += conversation.users
-        all_users = list(set(all_users))
+
+        all_users = {}
+        for convid in conv_ids:
+            conv_data = self.conversations.catalog[convid]
+            for chat_id in conv_data["participants"]:
+                all_users[chat_id] = self.get_hangups_user(chat_id) # by key for uniqueness
+
+        all_users = list(all_users.values())
+
         return all_users
 
     def get_config_option(self, option):
@@ -349,7 +441,7 @@ class HangupsBot(object):
     def print_conversations(self):
         print(_('Conversations:'))
         for c in self.list_conversations():
-            print('  {} ({}) u:{}'.format(get_conv_name(c, truncate=True), c.id_, len(c.users)))
+            print('  {} ({}) u:{}'.format(self.conversations.get_name(c), c.id_, len(c.users)))
             for u in c.users:
                 print('    {} ({}) {}'.format(u.first_name, u.full_name, u.id_.chat_id))
         print()
@@ -418,13 +510,13 @@ class HangupsBot(object):
                         introduction =_("<i>Hi there! I'll be using this channel to send private "
                                         "messages and alerts. "
                                         "For help, type <b>{0} help</b>. "
-                                        "To keep me quiet, reply with <b>{0} opt-out</b>.</i>").format(self._handlers.bot_command[0])
+                                        "To keep me quiet, reply with <b>{0} optout</b>.</i>").format(self._handlers.bot_command[0])
                     response = yield from self._client.createconversation([chat_id])
                     new_conversation_id = response['conversation']['id']['id']
                     self.send_html_to_conversation(new_conversation_id, introduction)
                     conversation = FakeConversation(self._client, new_conversation_id)
                 except Exception as e:
-                    logging.exception("GET_1TO1: failed to create 1-to-1 for user {}", chat_id)
+                    logging.exception("GET_1TO1: failed to create 1-to-1 for user {}".format(chat_id))
             else:
                 """legacy behaviour: user must say hi to the bot first
                 this creates a conversation entry in self._conv_list (even if the bot receives
@@ -497,9 +589,31 @@ class HangupsBot(object):
                                                    initial_data.conversation_states,
                                                    self._user_list,
                                                    initial_data.sync_timestamp)
+
         self._conv_list.on_event.add_observer(self._on_event)
 
+        self._client.on_state_update.add_observer(self._on_status_changes)
+
+        self.conversations = conversation_memory(self)
+
         plugins.load(self, command)
+
+
+    def _on_status_changes(self, state_update):
+        if state_update.typing_notification is not None:
+            asyncio.async(
+                self._handlers.handle_typing_notification(
+                    TypingEvent(self, state_update.typing_notification)
+                )
+            ).add_done_callback(lambda future: future.result())
+
+        if state_update.watermark_notification is not None:
+            asyncio.async(
+                self._handlers.handle_watermark_notification(
+                    WatermarkEvent(self, state_update.watermark_notification)
+                )
+            ).add_done_callback(lambda future: future.result())
+
 
     def _on_event(self, conv_event):
         """Handle conversation events"""
@@ -518,6 +632,8 @@ class HangupsBot(object):
 
         event = ConversationEvent(self, conv_event)
 
+        self.conversations.update(self._conv_list.get(conv_event.conversation_id), source="event")
+
         if isinstance(conv_event, hangups.ChatMessageEvent):
             self._execute_hook("on_chat_message", event)
             asyncio.async(self._handlers.handle_chat_message(event))
@@ -530,6 +646,16 @@ class HangupsBot(object):
             self._execute_hook("on_rename", event)
             asyncio.async(self._handlers.handle_chat_rename(event))
 
+        elif type(conv_event) is hangups.conversation_event.ConversationEvent:
+            if conv_event._event.hangout_event:
+                asyncio.async(
+                    self._handlers.handle_call(event)
+                ).add_done_callback(lambda future: future.result())
+
+        else:
+            logging.warning("_on_event(): unrecognised event type: {}".format(type(conv_event)))
+
+
     def _execute_hook(self, funcname, parameters=None):
         for hook in self._hooks:
             method = getattr(hook, funcname, None)
@@ -537,9 +663,7 @@ class HangupsBot(object):
                 try:
                     method(parameters)
                 except Exception as e:
-                    message = _("_execute_hooks()"), hook, e
-                    print(message)
-                    logging.exception(message)
+                    logging.exception("HOOKS: {}".format(hook))
 
     def _on_disconnect(self):
         """Handle disconnecting"""

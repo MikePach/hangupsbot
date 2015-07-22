@@ -1,6 +1,5 @@
 import asyncio,re,logging
 
-from hangups.ui.utils import get_conv_name
 
 class __internal_vars():
     def __init__(self):
@@ -55,8 +54,14 @@ def _populate_keywords(bot, event):
 def _send_notification(bot, event, phrase, user):
     """Alert a user that a keyword that they subscribed to has been used"""
 
-    conversation_name = get_conv_name(event.conv, truncate=True);
+    conversation_name = bot.conversations.get_name(event.conv)
     logging.info(_("subscribe: keyword '{}' in '{}' ({})").format(phrase, conversation_name, event.conv.id_))
+
+    """support for reprocessor
+    override the source name by defining event._external_source"""
+    source_name = event.user.full_name
+    if hasattr(event, '_external_source'):
+        source_name = event._external_source
 
     """send alert with 1on1 conversation"""
     conv_1on1 = bot.get_1on1_conversation(user.id_.chat_id)
@@ -69,7 +74,7 @@ def _send_notification(bot, event, phrase, user):
             bot.send_message_parsed(
                 conv_1on1,
                 _("<b>{}</b> mentioned '{}' in <i>{}</i>:<br />{}").format(
-                    event.user.full_name,
+                    source_name,
                     phrase,
                     conversation_name,
                     event.text))

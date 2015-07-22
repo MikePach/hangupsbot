@@ -1,7 +1,6 @@
 import sys, json, asyncio, logging, os
 
 import hangups
-from hangups.ui.utils import get_conv_name
 
 from version import __version__
 from utils import text_to_segments
@@ -21,9 +20,21 @@ class CommandDispatcher(object):
         self.tracking = tracking
 
     def get_admin_commands(self, bot, conv_id):
-        """Get list of admin-only commands (set by plugins or in config.json)"""
-        commands_admin = bot.get_config_suboption(conv_id, 'commands_admin') or []
-        return list(set(commands_admin + self.admin_commands))
+        """Get list of admin-only commands (set by plugins or in config.json)
+        list of commands is determined via one of two methods:
+            default mode allows individual plugins to make the determination for admin and user
+              commands, user commands can be "promoted" to admin commands via config.json:commands_admin
+            override this behaviour by defining config.json:commands_user, which will only allow
+              commands which are explicitly defined in this config key to be executed by users.
+              note: overriding default behaviour makes all commands admin-only by default
+        """
+        whitelisted_commands = bot.get_config_suboption(conv_id, 'commands_user') or []
+        if whitelisted_commands:
+            admin_command_list = self.commands.keys() - whitelisted_commands
+        else:
+            commands_admin = bot.get_config_suboption(conv_id, 'commands_admin') or []
+            admin_command_list = commands_admin + self.admin_commands
+        return list(set(admin_command_list))
 
     @asyncio.coroutine
     def run(self, bot, event, *args, **kwds):
@@ -41,8 +52,8 @@ class CommandDispatcher(object):
         try:
             yield from func(bot, event, *args, **kwds)
         except Exception as e:
-            message = _("CommandDispatcher.run: {}").format(func.__name__)
-            print(_("EXCEPTION in {}").format(message))
+            message = "CommandDispatcher.run: {}".format(func.__name__)
+            print("EXCEPTION in {}".format(message))
             logging.exception(message)
 
     def register(self, *args, admin=False):
@@ -107,19 +118,33 @@ def help(bot, event, cmd=None, *args):
             return
 
     # help can get pretty long, so we send a short message publicly, and the actual help privately
-    conv_1on1_initiator = bot.get_1on1_conversation(event.user.id_.chat_id)
+
+    if "get_1to1" in dir(bot):
+        conv_1on1_initiator = yield from bot.get_1to1(event.user.id_.chat_id)
+    else:
+        conv_1on1_initiator = bot.get_1on1_conversation(event.user.id_.chat_id)
+
     if conv_1on1_initiator:
         bot.send_message_parsed(conv_1on1_initiator, "<br />".join(help_lines))
         if conv_1on1_initiator.id_ != event.conv_id:
-            bot.send_message_parsed(event.conv, _("<i>{}, I've sent you some help ;)</i>").format(event.user.full_name))
+            bot.send_message_parsed(event.conv, _("<i>{}, I've sent you some help ;)</i>")
+                .format(event.user.full_name))
     else:
-        bot.send_message_parsed(event.conv, _("<i>{}, before I can help you, you need to private message me and say hi.</i>").format(event.user.full_name))
+        if type(conv_1on1_initiator) is bool:
+            bot.send_message_parsed(event.conv, 
+                _("<i>{}, you are currently opted-out. Private message me or enter <b>{} optout</b> to get me to talk to you.</i>")
+                    .format(event.user.full_name, min(bot._handlers.bot_command, key=len)))
+        else:
+            # type(conv_1on1_initiator) is NoneType and conv_1on1_initiator is None
+            bot.send_message_parsed(event.conv, 
+                _("<i>{}, before I can help you, you need to private message me and say hi.</i>")
+                    .format(event.user.full_name))
 
 
 @command.register
 def ping(bot, event, *args):
     """reply to a ping"""
-    bot.send_message(event.conv, _('pong'))
+    bot.send_message(event.conv, 'pong')
 
 
 @command.register

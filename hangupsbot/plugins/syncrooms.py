@@ -1,4 +1,4 @@
-import asyncio 
+import asyncio
 import re
 import time
 import os
@@ -8,7 +8,6 @@ import io
 import hangups
 
 from urllib.parse import urlparse
-from hangups.ui.utils import get_conv_name
 
 import plugins
 
@@ -89,11 +88,16 @@ def _handle_syncrooms_broadcast(bot, broadcast_list, context):
             else:
                 print(_("syncrooms: not a sync room").format(origin_conversation_id))
 
-
 @asyncio.coroutine
 def _handle_incoming_message(bot, event, command):
     """Handle message syncing"""
     if not bot.get_config_option('syncing_enabled'):
+        return
+
+    if "_slack_no_repeat" in dir(event) and event._slack_no_repeat:
+        return
+
+    if "_syncroom_no_repeat" in dir(event) and event._syncroom_no_repeat:
         return
 
     syncouts = bot.get_config_option('sync_rooms')
@@ -148,24 +152,12 @@ def _handle_incoming_message(bot, event, command):
 
             ### Name decided and put into variable 'fullname'
 
-            segments = [hangups.ChatMessageSegment('{0}'.format(fullname), hangups.SegmentType.LINK,
-                                                   link_target=link, is_bold=True),
-                        hangups.ChatMessageSegment(': ', is_bold=True)]
+            html = '<b><a href="{}">{}</a></b>: '.format(link, fullname)
 
-            # Make links hyperlinks and send message
+            # send message
             URL_RE = re.compile(r'https?://\S+')
             for segment in event.conv_event.segments:
-                last = 0
-                for match in URL_RE.finditer(segment.text):
-                    if match.start() > last:
-                        segments.append(hangups.ChatMessageSegment(segment.text[last:match.start()]))
-                    segments.append(hangups.ChatMessageSegment(match.group(), link_target=match.group()))
-                    last = match.end()
-                if last != len(segment.text):
-                    if segment.type_ is hangups.SegmentType.LINE_BREAK:
-                        segments.append(hangups.ChatMessageSegment('\n', hangups.SegmentType.LINE_BREAK))
-                    else:
-                        segments.append(hangups.ChatMessageSegment(segment.text[last:]))
+                html += segment.text
 
             for _conv_id in sync_room_list:
                 if not _conv_id == event.conv_id:
@@ -179,7 +171,7 @@ def _handle_incoming_message(bot, event, command):
                             "event_text" : event.text }
 
                     if not event.conv_event.attachments:
-                        bot.send_message_segments(_conv_id, list(segments), context=_context)
+                        bot.send_html_to_conversation(_conv_id, html, context=_context)
 
                     for link in event.conv_event.attachments:
                         # Attempt to upload the photo first
@@ -191,13 +183,11 @@ def _handle_incoming_message(bot, event, command):
 
                         try:
                             image_id = yield from bot._client.upload_image(image_data, filename=filename)
-                            segments.append(hangups.ChatMessageSegment('\n', hangups.SegmentType.LINE_BREAK))
-                            segments.append(hangups.ChatMessageSegment('incoming image:', is_italic=True))
+                            html += "<br /><i>Incoming image...</i><br />"
                         except AttributeError:
-                            segments.extend([hangups.ChatMessageSegment(link, hangups.SegmentType.LINK, link_target=link)])
+                            html += link + "<br />"
 
-                        segments.append(hangups.ChatMessageSegment('\n', hangups.SegmentType.LINE_BREAK))
-                        bot.send_message_segments(_conv_id, list(segments), context=_context)
+                        bot.send_html_to_conversation(_conv_id, html, context=_context)
                         if image_id:
                             bot.send_message_segments(_conv_id, None, context=_context, image_id=image_id)
 
@@ -231,11 +221,11 @@ def _handle_syncrooms_membership_change(bot, event, command):
         return
 
     # Generate list of added or removed users for current ROOM (NOT SYNCROOMS!)
-    event_users = [event.conv.get_user(user_id) for user_id
+    event_users = [bot.get_hangups_user(user_id) for user_id
                    in event.conv_event.participant_ids]
     names = ', '.join([user.full_name for user in event_users])
 
-    syncroom_name = '<b>' + get_conv_name(event.conv) + '</b>'
+    syncroom_name = '<b>' + bot.conversations.get_name(event.conv) + '</b>'
 
     # JOIN a specific room
     if event.conv_event.type_ == hangups.MembershipChangeType.JOIN:
@@ -291,20 +281,24 @@ def syncusers(bot, event, conversation_id=None, *args):
         _lines.append(_("<b>Standard Room</b>"))
 
     all_users = {}
-    if combined or len(sync_room_list) == 1:
-        all_users["_ALL_"] = bot.get_users_in_conversation(sync_room_list)
-    else:
-        for room_id in sync_room_list:
-            all_users[room_id] = bot.get_users_in_conversation(room_id)
+    try:
+        if combined or len(sync_room_list) == 1:
+            all_users["_ALL_"] = bot.get_users_in_conversation(sync_room_list)
+        else:
+            for room_id in sync_room_list:
+                all_users[room_id] = bot.get_users_in_conversation(room_id)
+    except KeyError as e:
+        # most likely raised if user provides invalid room list
+        bot.send_message_parsed(event.conv, _('<b>failed to retrieve user list</b>'))
+        return
 
     unique_users = []
 
     for room_id in all_users:
         if room_id is not "_ALL_":
             _line_room = '<i>{}</i>'.format(room_id)
-            """XXX: written in this way in case we need to try: get_conv_name in future"""
             _line_room = '<b>{}</b> {}'.format(
-                get_conv_name(bot._conv_list.get(room_id)),
+                bot.conversations.get_name(room_id),
                 _line_room)
             _lines.append(_line_room)
         list_users = all_users[room_id]
